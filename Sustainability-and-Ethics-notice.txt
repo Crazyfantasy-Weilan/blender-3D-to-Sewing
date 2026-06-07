@@ -1,0 +1,14 @@
+This add-on is licenced under GPL, see GPL-license.txt for details.
+
+Since this add-on is textile related, there are three ethical issues
+that the usage of it might inadvertently contribute to:
+
+- Inhumane working conditons,
+- Environmental pollution,
+- Climate change.
+
+These issues are important to me, the developer, so if you, the
+reader of this notice, think that your end use contributes to one of
+these issues, I ask you or your organisation not to use this add-on.
+
+Thank you for understanding.

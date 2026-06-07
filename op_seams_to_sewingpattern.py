@@ -1,0 +1,378 @@
+import bpy
+from collections import defaultdict
+from bpy.types import Operator
+import bmesh
+import mathutils
+import math
+from bpy.props import (
+    BoolProperty,
+    IntProperty,
+    EnumProperty,
+)
+
+if bpy.app.version >= (3, 0, 0):
+    from . import function_wrapper_3_0 as function_wrapper
+elif bpy.app.version >= (2, 90, 0):
+    from . import function_wrapper_2_9 as function_wrapper
+else:
+    from . import function_wrapper_2_8 as function_wrapper
+
+
+class Seams_To_SewingPattern(Operator):
+    bl_idname = "object.seams_to_sewingpattern"
+    bl_label = "生成缝纫纸样"
+    bl_description = (
+        "将带接缝的网格转换为缝纫纸样，用于布料模拟"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None:
+            return False
+        if hasattr(obj, 'type'):
+            return obj.type == 'MESH'
+        return False
+
+    do_unwrap: EnumProperty(
+        name="UV展开方式",
+        description=(
+            "展开前进行UV展开，等同于 UV > Unwrap"
+        ),
+        items=(
+            ('ANGLE_BASED', "角度法", ""),
+            ('CONFORMAL', "保形法", ""),
+            ('KEEP', "保留现有UV (高级)", ""),
+        ),
+        default='ANGLE_BASED',
+    )
+    keep_original: BoolProperty(
+        name="复制原物体",
+        description=(
+            "复制选中的物体并在副本上操作，保留原物体不变"
+        ),
+        default=True,
+    )
+    use_remesh: BoolProperty(
+        name="重新网格化",
+        description="使用边界对齐重网格化",
+        default=True,
+    )
+    apply_modifiers: BoolProperty(
+        name="应用修改器",
+        description="操作前应用所有修改器",
+        default=True,
+    )
+    target_tris: IntProperty(
+        name="目标三角面数",
+        description="实际三角面数可能略有偏差",
+        default=5000,
+    )
+
+    def invoke(self, context, event):
+        wm = context.window_manager
+        return wm.invoke_props_dialog(self, width=250)
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row()
+        row.label(
+            text="沿接缝切割并展开网格", icon='INFO'
+        )
+        layout.separator()
+        layout.row()
+        layout.row()
+        row = layout.row()
+        row.prop(self, "do_unwrap")
+        if(self.do_unwrap == 'KEEP'):
+            row = layout.row()
+            row.alignment = 'EXPAND'
+            row.label(
+                text="请确保接缝与UV匹配！", icon='EDGESEL'
+            )
+
+        layout.row()
+        row = layout.row()
+        row.prop(self, "keep_original")
+        row = layout.row()
+        row.prop(self, "apply_modifiers")
+        row = layout.row()
+        row.prop(self, "use_remesh")
+        row = layout.row()
+        row.prop(self, "target_tris")
+        row.enabled = self.use_remesh
+        layout.row()
+        
+        # 布料模拟按钮
+        layout.separator()
+        box = layout.box()
+        box.label(text="布料模拟设置", icon='MOD_CLOTH')
+        box.operator("object.sewing_pattern_clothsim", text="布料模拟设置", icon='MOD_CLOTH')
+
+    def execute(self, context):
+        if self.keep_original:
+            # Duplicate selection to keep original.
+            src_obj = bpy.context.active_object
+            obj = src_obj.copy()
+            obj.data = src_obj.data.copy()
+            obj.animation_data_clear()
+            bpy.context.collection.objects.link(obj)
+
+            obj.select_set(True)
+            src_obj.select_set(False)
+            bpy.context.view_layer.objects.active = obj
+
+        if self.apply_modifiers:
+            bpy.ops.object.convert(target='MESH')
+            obj = bpy.context.active_object
+
+        wm = bpy.context.window_manager
+        bpy.ops.object.mode_set(mode='EDIT')
+
+        obj = bpy.context.edit_object
+        me = obj.data
+
+        bpy.ops.mesh.select_mode(type="EDGE")
+
+        bpy.ops.mesh.select_all(action='SELECT')
+        if (self.do_unwrap != 'KEEP'):
+            bpy.ops.uv.unwrap(method=self.do_unwrap, margin=0.02)
+        bpy.ops.mesh.select_all(action='DESELECT')
+
+        bm = bmesh.from_edit_mesh(me)
+
+        obj["S2S_InitialVolume"] = bm.calc_volume()
+
+        function_wrapper.do_update_edit_mesh(me)
+
+        # Calculate edge length based on a surface of equilateral triangles.
+
+        if (self.use_remesh):
+            current_area = sum(f.calc_area() for f in bm.faces)
+            target_triangle_count = self.target_tris
+            area_per_triangle = current_area / target_triangle_count
+
+            max_edge_length = math.sqrt(area_per_triangle/(math.sqrt(3)/4))
+
+            # A bias to compensate for stretching.
+            self.ensure_edgelength(max_edge_length * 0.8, bm, wm)
+
+        warn_any_seam = False
+
+        for e in bm.edges:
+            if e.seam:
+                e.select = True
+                warn_any_seam = True
+
+        if not warn_any_seam:
+            self.report(
+                {'ERROR'},
+                (
+                    'There are no seams in this mesh. Please add seams where'
+                    ' you want to cut the model.'
+                )
+            )
+            return {'CANCELLED'}
+
+        function_wrapper.do_bevel()
+
+        #####
+        '''
+        error now because I need to fix the fact that fanning edges dont exist
+        anymore maybe by finding ngons instead?
+        or removing doubled afer
+        '''
+        #####
+
+        # fix fanning seams
+        degenerate_edges = list()
+        for f in list(filter(lambda f: (f.select), bm.faces)):
+            is_degenerate = False
+            for v in f.verts:
+                vert_degenerate = True
+                for e in v.link_edges:
+                    if e.seam:
+                        vert_degenerate = False
+                if vert_degenerate:
+                    is_degenerate = True
+
+            for e in f.edges:
+                if e.is_boundary:
+                    is_degenerate = False
+
+            if is_degenerate:
+                for e in f.edges:
+                    degenerate_edges.append(e)
+
+        bmesh.ops.collapse(bm, edges=degenerate_edges, uvs=True)
+
+        bpy.ops.mesh.delete(type='ONLY_FACE')
+
+        bpy.ops.mesh.select_mode(type="FACE")
+        faceGroups = []
+
+        # isolate all face islands, and UV unwrap each island
+
+        faces = set(bm.faces[:])
+        wm.progress_begin(0, 99)
+        progress_max = len(faces)
+        progress = 0
+        while faces:
+            bpy.ops.mesh.select_all(action='DESELECT')
+            face = faces.pop()
+            face.select = True
+            bpy.ops.mesh.select_linked()
+            selected_faces = {f for f in faces if f.select}
+            selected_faces.add(face)  # this or bm.faces above?
+            faceGroups.append(selected_faces)
+            faces -= selected_faces
+
+            progress += len(selected_faces)
+            wm.progress_update((progress / progress_max))
+
+        uv_layer = bm.loops.layers.uv.active
+
+        progress = 0
+
+        area_before = 0
+        area_after = 0
+
+        for g in faceGroups:
+            progress += 1
+            wm.progress_update((progress / len(faceGroups)))
+            bpy.ops.mesh.select_mode(type='FACE')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            average_position = mathutils.Vector((0, 0, 0))
+            facenum = 0
+
+            # calculate the area, average position
+
+            for f in g:
+                f.select = True
+                area_before += f.calc_area()
+                average_position += f.calc_center_median()
+                facenum += 1
+
+            average_position /= facenum
+
+            average_tangent = mathutils.Vector((0, 0, 0))
+            average_bitangent = mathutils.Vector((0, 0, 0))
+
+            # calculate a rough tangent and a bitangent
+
+            average_uv_position = mathutils.Vector((0, 0))
+            uv_position_samples = 0
+
+            for face in g:
+                for loop in face.loops:
+                    uv = loop[uv_layer].uv
+                    uv_position_samples += 1
+                    average_uv_position += uv
+                    delta = loop.vert.co - average_position
+                    average_tangent += delta * (uv.x - 0.5)
+                    average_bitangent += delta * (uv.y - 0.5)
+
+            # reorient the tangent and bitangent
+
+            average_uv_position /= uv_position_samples
+            average_tangent = average_tangent.normalized()
+            average_bitangent = average_bitangent.normalized()
+            average_normal = average_tangent.cross(
+                average_bitangent
+            ).normalized()
+            halfvector = average_bitangent + average_tangent
+            halfvector /= 2
+            halfvector.normalize()
+            # straighten out half vector
+            halfvector = average_normal.cross(halfvector)
+            halfvector = average_normal.cross(halfvector)
+            cw = mathutils.Matrix.Rotation(
+                math.radians(45.0), 4, average_normal
+            )
+            ccw = mathutils.Matrix.Rotation(
+                math.radians(-45.0), 4, average_normal
+            )
+
+            average_tangent = mathutils.Vector(halfvector)
+            average_tangent.rotate(ccw)
+
+            average_bitangent = mathutils.Vector(halfvector)
+            average_bitangent.rotate(cw)
+
+            # offset each face island by their UV value, using the tangent and
+            # bitangent
+
+            for face in g:
+                for loop in face.loops:
+                    uv = loop[uv_layer].uv
+                    vert = loop.vert
+                    pos = mathutils.Vector((0, 0, 0))
+                    pos += average_position
+                    pos += average_tangent * -(uv.x - average_uv_position.x)
+                    pos += average_bitangent * -(uv.y - average_uv_position.y)
+                    # arbitrary - should probably depend on object scale?
+                    pos += average_normal * 0.3
+                    vert.co = pos
+
+            function_wrapper.do_update_edit_mesh(me)
+            area_after += sum(f.calc_area() for f in g)
+
+        # done
+
+        area_ratio = math.sqrt(area_before / area_after)
+        bpy.ops.mesh.select_all(action='SELECT')
+        previous_pivot = bpy.context.scene.tool_settings.transform_pivot_point
+        bpy.context.scene.tool_settings.transform_pivot_point = (
+            'INDIVIDUAL_ORIGINS'
+        )
+        bpy.ops.transform.resize(value=(area_ratio, area_ratio, area_ratio))
+        bpy.context.scene.tool_settings.transform_pivot_point = previous_pivot
+
+        obj["S2S_UVtoWORLDscale"] = area_ratio
+
+        function_wrapper.do_update_edit_mesh(me)
+        bpy.ops.mesh.select_all(action='SELECT')
+
+        bpy.ops.mesh.remove_doubles(threshold=0.0004, use_unselected=False)
+
+        if (self.use_remesh):
+            bpy.ops.mesh.dissolve_limited(angle_limit=0.01)
+            bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+            bpy.ops.remesh.boundary_aligned_remesh(
+                edge_length=max_edge_length, iterations=10, reproject=False
+            )
+
+        bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+
+        wm.progress_end()
+
+        # fix 2.9 wm.progress problem
+        bpy.context.window.cursor_set('NONE')
+        bpy.context.window.cursor_set('DEFAULT')
+
+        return{'FINISHED'}
+
+    def ensure_edgelength(self, max_length, mesh, wm):
+        seam_edges = list(filter(lambda e: e.seam, mesh.edges))
+        edge_groups = defaultdict(list)
+        for e in seam_edges:
+            edge_groups[math.floor(e.calc_length() / max_length)].append(e)
+
+        wm.progress_begin(0, 99)
+        progress = 0
+
+        # A little weird, but by grouping the edges by number of required cuts,
+        # subdivide_edges() can work a lot more effecient
+
+        for eg in edge_groups.values():
+            edge_length = eg[0].calc_length()
+            wm.progress_update((progress / len(edge_groups)))
+            bmesh.ops.subdivide_edges(
+                mesh, edges=eg, cuts=math.floor(edge_length / max_length)
+            )
+
+        bmesh.ops.triangulate(
+            mesh, faces=mesh.faces, quad_method='BEAUTY', ngon_method='BEAUTY'
+        )
+        # done
